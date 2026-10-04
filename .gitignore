@@ -1,0 +1,14 @@
+# Dependencias y compilaciones
+node_modules/
+.next/
+coverage/
+
+# Secretos: NUNCA se suben
+.env
+.env.*
+!.env.example
+
+# Temporales de pruebas reales
+.tmp-smoke/
+.DS_Store
+.impeccable/

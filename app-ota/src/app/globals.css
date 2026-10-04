@@ -1,0 +1,124 @@
+@import "tailwindcss";
+
+/* =====================================================================
+   Sistema de diseño: "cuaderno de viaje caribeño"
+   Todos los colores y espacios salen de estas variables (no hay valores sueltos en los componentes).
+   ===================================================================== */
+:root {
+  --sand: #f5efe4;       /* fondo general */
+  --paper: #fffcf6;      /* superficies elevadas (tarjetas) */
+  --ink: #10242b;        /* texto principal */
+  --muted: #566a70;      /* texto secundario (contraste AA sobre sand) */
+  --sea: #0b6e7a;        /* azul caribeño: acciones y enlaces */
+  --sea-deep: #07434b;   /* azul profundo: secciones oscuras */
+  --coral: #e2552b;      /* atardecer: acento y llamadas a la acción */
+  --coral-deep: #b83a14; /* coral sobre fondo claro con texto (contraste) */
+  --gold: #c99a2e;       /* detalles */
+  --line: #dccfb8;       /* bordes suaves */
+  --ok: #1f7a4d;
+  --warn: #9a6a00;
+  --bad: #b3261e;
+
+  --radius-card: 1.25rem;
+  --shadow-lift: 0 1px 0 rgb(16 36 43 / 0.04), 0 18px 40px -18px rgb(16 36 43 / 0.28);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --sand: #0d1a1f;
+    --paper: #14262d;
+    --ink: #f3ebdb;
+    --muted: #a3b4b8;
+    --sea: #4fc1cd;
+    --sea-deep: #031f24;
+    --coral: #ff7a4d;
+    --coral-deep: #ff8f67;
+    --gold: #e0b44a;
+    --line: #27414a;
+    --ok: #5ccf97;
+    --warn: #e5b94a;
+    --bad: #ff8a80;
+    --shadow-lift: 0 1px 0 rgb(0 0 0 / 0.3), 0 18px 40px -18px rgb(0 0 0 / 0.7);
+  }
+}
+
+@theme inline {
+  --color-sand: var(--sand);
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-sea: var(--sea);
+  --color-sea-deep: var(--sea-deep);
+  --color-coral: var(--coral);
+  --color-coral-deep: var(--coral-deep);
+  --color-gold: var(--gold);
+  --color-line: var(--line);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --font-display: var(--font-fraunces), Georgia, serif;
+  --font-sans: var(--font-hanken), system-ui, sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--sand);
+  color: var(--ink);
+  font-family: var(--font-sans);
+}
+
+/* Foco visible y consistente para teclado */
+:focus-visible {
+  outline: 3px solid var(--coral);
+  outline-offset: 3px;
+  border-radius: 0.375rem;
+}
+
+::selection {
+  background: var(--coral);
+  color: #fff;
+}
+
+/* Entrada escalonada: solo transform y opacity (animaciones baratas para el navegador) */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rise {
+  animation: rise 0.8s var(--ease-out) both;
+  animation-delay: calc(var(--i, 0) * 90ms);
+}
+
+@keyframes float-card {
+  0%, 100% { transform: rotate(-3deg) translateY(0); }
+  50% { transform: rotate(-3deg) translateY(-8px); }
+}
+
+.float-card {
+  animation: float-card 7s ease-in-out infinite;
+}
+
+/* Respeto a quien prefiere menos movimiento */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .rise, .float-card { animation: none; }
+  * { transition-duration: 0.01ms !important; }
+}
+
+/* Borde perforado tipo boleto */
+.perforation {
+  background-image: radial-gradient(circle at 50% 50%, var(--sand) 5px, transparent 5.5px);
+  background-size: 100% 18px;
+  background-repeat: repeat-y;
+}

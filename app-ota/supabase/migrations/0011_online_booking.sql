@@ -1,0 +1,350 @@
+-- 0011: reserva en línea sin agente + límite de intentos
+-- * bookings.source / access_token_hash / hold_expires_at: la compra del cliente queda marcada, con un enlace
+--   secreto (solo se guarda su huella SHA-256) y un plazo para pagar.
+-- * create_tour_booking acepta p_source = 'ONLINE' (solo la llave de servicio puede ejecutarla).
+-- * expire_online_holds(): libera los cupos de reservas en línea que nadie pagó a tiempo.
+-- * take_online_attempt(): contador de intentos por clave (IP, teléfono o enlace) para frenar abusos.
+
+alter table public.bookings add column source text not null default 'AGENT' check (source in ('AGENT', 'ONLINE'));
+alter table public.bookings add column access_token_hash text unique check (access_token_hash is null or char_length(access_token_hash) = 64);
+alter table public.bookings add column hold_expires_at timestamptz;
+create index bookings_hold_expiry_idx on public.bookings (hold_expires_at) where source = 'ONLINE' and status = 'PENDING_PAYMENT';
+
+-- Los agentes ven el origen y el plazo, pero NUNCA la huella del enlace del cliente
+grant select (source, hold_expires_at) on public.bookings to authenticated;
+
+-- Un agente no puede cambiar el origen, el plazo ni el enlace de una reserva (ni siquiera con permiso de UPDATE)
+create or replace function public.guard_online_columns()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if current_user = 'authenticated'
+     and (new.source, new.access_token_hash, new.hold_expires_at)
+         is distinct from (old.source, old.access_token_hash, old.hold_expires_at) then
+    raise exception 'CAMPOS_BLOQUEADOS';
+  end if;
+  return new;
+end;
+$$;
+create trigger bookings_guard_online before update on public.bookings
+  for each row execute function public.guard_online_columns();
+
+drop function if exists public.create_tour_booking(uuid, uuid, uuid, text, text, text, boolean, jsonb, bigint, bigint, bigint);
+
+create or replace function public.create_tour_booking(
+  p_actor               uuid,
+  p_form_token          uuid,
+  p_departure_id        uuid,
+  p_customer_name       text,
+  p_phone               text,
+  p_email               text,
+  p_whatsapp_opt_in     boolean,
+  p_passengers          jsonb,
+  p_supplier_cost_cents bigint,
+  p_service_fee_cents   bigint,
+  p_itbis_cents         bigint,
+  p_source              text default 'AGENT',   -- 'ONLINE' = compra del propio cliente (sin agente)
+  p_access_token_hash   text default null,      -- huella del enlace secreto del cliente (solo ONLINE)
+  p_hold_hours          integer default null    -- horas que se guarda el cupo sin pago (solo ONLINE)
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_dep       public.tour_departures%rowtype;
+  v_tour      public.tours%rowtype;
+  v_customer  uuid;
+  v_optin     timestamptz;
+  v_booking   uuid;
+  v_elem      jsonb;
+  v_normal    jsonb := '[]'::jsonb;
+  v_name      text;
+  v_type      text;
+  v_room      text;
+  v_birth     date;
+  v_age       integer;
+  v_adults    integer := 0;
+  v_children  integer := 0;
+  v_infants   integer := 0;
+  v_count     integer := 0;
+  v_total     bigint := 0;
+  v_snapshot  jsonb;
+  v_fila      jsonb;
+begin
+  if p_source not in ('AGENT', 'ONLINE') then
+    raise exception 'NO_AUTORIZADO';
+  end if;
+  if p_source = 'ONLINE' then
+    -- Compra en línea: no hay agente, el enlace secreto es obligatorio y NUNCA se da consentimiento de WhatsApp
+    -- (lo confirma un agente hablando con el cliente)
+    if p_actor is not null or p_access_token_hash is null or char_length(p_access_token_hash) <> 64
+       or p_hold_hours is null or p_hold_hours not between 1 and 168 then
+      raise exception 'NO_AUTORIZADO';
+    end if;
+    p_whatsapp_opt_in := false;
+  elsif not exists (select 1 from public.profiles where id = p_actor and role in ('ADMIN', 'AGENT')) then
+    raise exception 'NO_AUTORIZADO';
+  end if;
+
+  if char_length(btrim(coalesce(p_customer_name, ''))) not between 2 and 120
+     or char_length(coalesce(p_email, '')) > 254 then
+    raise exception 'DATOS_CLIENTE_INVALIDOS';
+  end if;
+
+  -- Idempotencia: el mismo formulario enviado dos veces devuelve la misma reserva
+  select id into v_booking from public.bookings where form_token = p_form_token;
+  if found then
+    return v_booking;
+  end if;
+
+  -- Bloquea la salida: dos agentes no pueden vender el último asiento a la vez
+  select * into v_dep from public.tour_departures where id = p_departure_id for update;
+  if not found then
+    raise exception 'SALIDA_NO_EXISTE';
+  end if;
+  if v_dep.status <> 'OPEN' then
+    raise exception 'SALIDA_NO_DISPONIBLE: %', v_dep.status;
+  end if;
+  if (now() at time zone 'America/Santo_Domingo')::date > v_dep.sale_closes_on then
+    raise exception 'VENTA_CERRADA';
+  end if;
+
+  select * into v_tour from public.tours where id = v_dep.tour_id;
+  -- Un tour sin publicar no se puede comprar en línea aunque alguien conozca el id de su salida
+  if p_source = 'ONLINE' and not v_tour.published then
+    raise exception 'SALIDA_NO_DISPONIBLE: no publicada';
+  end if;
+
+  if jsonb_typeof(p_passengers) <> 'array' or jsonb_array_length(p_passengers) not between 1 and 9 then
+    raise exception 'PASAJEROS_INVALIDOS';
+  end if;
+
+  -- Valida cada pasajero y suma el precio según su categoría
+  for v_elem in select * from jsonb_array_elements(p_passengers) loop
+    v_count := v_count + 1;
+    if jsonb_typeof(v_elem) = 'string' then
+      v_name := btrim(v_elem #>> '{}'); v_type := 'ADULT'; v_room := 'DOUBLE'; v_birth := null;
+    elsif jsonb_typeof(v_elem) = 'object' then
+      v_name  := btrim(coalesce(v_elem ->> 'name', ''));
+      v_type  := coalesce(v_elem ->> 'type', 'ADULT');
+      v_room  := coalesce(v_elem ->> 'room', 'DOUBLE');
+      v_birth := nullif(v_elem ->> 'birth_date', '')::date;
+    else
+      raise exception 'PASAJEROS_INVALIDOS';
+    end if;
+
+    if char_length(v_name) not between 2 and 100 then
+      raise exception 'PASAJEROS_INVALIDOS';
+    end if;
+    if v_type not in ('ADULT', 'CHILD', 'INFANT') or v_room not in ('DOUBLE', 'SINGLE') then
+      raise exception 'PASAJEROS_INVALIDOS';
+    end if;
+
+    if v_birth is not null then
+      if v_birth > v_dep.returns_on then
+        raise exception 'FECHA_NACIMIENTO_INVALIDA';
+      end if;
+      v_age := extract(year from age(v_dep.returns_on, v_birth))::integer;
+      if (v_type = 'INFANT' and v_age > v_dep.infant_max_age)
+         or (v_type = 'CHILD' and (v_age <= v_dep.infant_max_age or v_age > v_dep.child_max_age))
+         or (v_type = 'ADULT' and v_age <= v_dep.child_max_age) then
+        raise exception 'EDAD_NO_COINCIDE';
+      end if;
+    elsif v_type <> 'ADULT' then
+      raise exception 'FALTA_FECHA_NACIMIENTO';
+    end if;
+
+    if v_room = 'SINGLE' then
+      if v_type <> 'ADULT' then
+        raise exception 'HABITACION_INVALIDA';
+      end if;
+      if v_dep.single_supplement_cents is null then
+        raise exception 'HABITACION_INDIVIDUAL_NO_DISPONIBLE';
+      end if;
+    end if;
+
+    if v_type = 'ADULT' then
+      v_adults := v_adults + 1;
+      v_total := v_total + v_dep.price_per_person_cents + case when v_room = 'SINGLE' then v_dep.single_supplement_cents else 0 end;
+    elsif v_type = 'CHILD' then
+      v_children := v_children + 1;
+      v_total := v_total + coalesce(v_dep.child_price_cents, v_dep.price_per_person_cents);
+    else
+      v_infants := v_infants + 1;
+      v_total := v_total + v_dep.infant_price_cents;
+    end if;
+
+    v_normal := v_normal || jsonb_build_array(
+      jsonb_build_object('name', v_name, 'type', v_type, 'room', v_room, 'birth', v_birth));
+  end loop;
+
+  if v_adults < 1 then
+    raise exception 'SIN_ADULTOS';
+  end if;
+  if v_infants > v_adults then
+    raise exception 'INFANTES_SIN_ADULTO';
+  end if;
+
+  -- Los infantes no ocupan asiento
+  if public.departure_seats_taken(v_dep.id) + v_adults + v_children > v_dep.capacity then
+    raise exception 'CUPO_AGOTADO';
+  end if;
+
+  -- El PRECIO lo calcula la base de datos desde la salida; el reparto debe sumar exactamente ese total
+  if p_supplier_cost_cents < 0 or p_service_fee_cents < 0 or p_itbis_cents < 0
+     or p_supplier_cost_cents + p_service_fee_cents + p_itbis_cents <> v_total then
+    raise exception 'TOTAL_NO_COINCIDE';
+  end if;
+  if p_itbis_cents <> round(p_service_fee_cents * 18 / 100.0) then
+    raise exception 'ITBIS_INCORRECTO';
+  end if;
+  if v_total <= 0 then
+    raise exception 'TOTAL_NO_COINCIDE';
+  end if;
+
+  select id, whatsapp_opt_in_at into v_customer, v_optin
+    from public.customers where phone_e164 = p_phone for update;
+  if found and p_source = 'ONLINE' then
+    if (select count(*) from public.bookings
+         where customer_id = v_customer and source = 'ONLINE' and status = 'PENDING_PAYMENT' and paid_cents = 0) >= 2 then
+      raise exception 'DEMASIADAS_RESERVAS_ABIERTAS';
+    end if;
+  end if;
+  if found then
+    if p_whatsapp_opt_in and v_optin is null then
+      update public.customers set whatsapp_opt_in_at = now(), privacy_consent_at = now() where id = v_customer;
+    end if;
+  else
+    insert into public.customers (full_name, phone_e164, email, assigned_agent_id, whatsapp_opt_in_at, privacy_consent_at)
+    values (
+      btrim(p_customer_name), p_phone, nullif(p_email, ''), p_actor,
+      case when p_whatsapp_opt_in then now() end,
+      case when p_whatsapp_opt_in then now() end
+    )
+    returning id into v_customer;
+  end if;
+
+  -- La política de cancelación se COPIA a la reserva: cambiarla después no altera lo ya prometido
+  select jsonb_build_object('name', cp.name, 'rules', cp.rules) into v_snapshot
+    from public.cancellation_policies cp where cp.id = v_tour.cancellation_policy_id;
+
+  begin
+    insert into public.bookings (
+      customer_id, product_type, status, currency,
+      supplier_cost_cents, service_fee_cents, itbis_cents, total_cents,
+      price_guaranteed, price_guaranteed_by, price_guaranteed_at, supplier_deadline, group_block_id,
+      departure_id, cancellation_snapshot, created_by, form_token, source, access_token_hash, hold_expires_at
+    ) values (
+      v_customer, 'PACKAGE', case when p_source = 'ONLINE' then 'PENDING_PAYMENT' else 'QUOTED' end, v_tour.currency,
+      p_supplier_cost_cents, p_service_fee_cents, p_itbis_cents, v_total,
+      true, p_actor, now(), v_dep.supplier_deadline, v_dep.group_block_id,
+      v_dep.id, v_snapshot, p_actor, p_form_token, p_source, p_access_token_hash,
+      case when p_source = 'ONLINE' then now() + make_interval(hours => p_hold_hours) end
+    )
+    returning id into v_booking;
+  exception when unique_violation then
+    select id into v_booking from public.bookings where form_token = p_form_token;
+    if found then
+      return v_booking;
+    end if;
+    raise;
+  end;
+
+  for v_fila in select * from jsonb_array_elements(v_normal) loop
+    insert into public.passengers (booking_id, full_name, passenger_type, birth_date, room_type)
+    values (
+      v_booking, v_fila ->> 'name', v_fila ->> 'type',
+      nullif(v_fila ->> 'birth', '')::date, v_fila ->> 'room'
+    );
+  end loop;
+
+  insert into public.audit_log (actor_id, action, entity, entity_id, details)
+  values (p_actor, 'TOUR_BOOKING_CREATED', 'bookings', v_booking::text,
+          jsonb_build_object('source', p_source, 'departure_id', v_dep.id, 'passengers', v_count, 'seats', v_adults + v_children, 'total_cents', v_total));
+
+  return v_booking;
+end;
+$$;
+
+revoke all on function public.create_tour_booking(uuid, uuid, uuid, text, text, text, boolean, jsonb, bigint, bigint, bigint, text, text, integer)
+  from public, anon, authenticated;
+grant execute on function public.create_tour_booking(uuid, uuid, uuid, text, text, text, boolean, jsonb, bigint, bigint, bigint, text, text, integer)
+  to service_role;
+
+-- ---------------------------------------------------------------------
+-- Expiración de reservas en línea sin pago
+-- ---------------------------------------------------------------------
+create or replace function public.expire_online_holds()
+returns integer
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_n integer;
+begin
+  with vencidas as (
+    update public.bookings b
+       set status = 'EXPIRED'
+     where b.source = 'ONLINE'
+       and b.status = 'PENDING_PAYMENT'
+       and b.paid_cents = 0
+       and b.hold_expires_at < now()
+       -- si el cliente ya envió un comprobante, la reserva espera al agente, no se vence
+       and not exists (select 1 from public.payments p where p.booking_id = b.id and p.status in ('PENDING_VERIFICATION', 'APPROVED'))
+    returning b.id
+  )
+  select count(*) into v_n from vencidas;
+  if v_n > 0 then
+    insert into public.audit_log (actor_id, action, entity, entity_id, details)
+    values (null, 'ONLINE_HOLDS_EXPIRED', 'bookings', 'batch', jsonb_build_object('count', v_n));
+  end if;
+  return v_n;
+end;
+$$;
+revoke all on function public.expire_online_holds() from public, anon, authenticated;
+grant execute on function public.expire_online_holds() to service_role;
+
+-- ---------------------------------------------------------------------
+-- Límite de intentos por clave (la aplicación manda una huella, nunca la IP o el teléfono en claro)
+-- ---------------------------------------------------------------------
+create table public.online_attempts (
+  id         bigint generated always as identity primary key,
+  key_hash   text not null check (char_length(key_hash) between 8 and 128),
+  created_at timestamptz not null default now()
+);
+create index online_attempts_key_idx on public.online_attempts (key_hash, created_at);
+alter table public.online_attempts enable row level security;  -- sin políticas: solo la llave de servicio
+revoke all on public.online_attempts from anon, authenticated;
+
+-- Devuelve true y registra el intento si aún no se alcanzó el máximo en la ventana; false si ya se alcanzó
+create or replace function public.take_online_attempt(p_key_hash text, p_max integer, p_window_minutes integer)
+returns boolean
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_n integer;
+begin
+  if p_max < 1 or p_window_minutes < 1 or p_window_minutes > 1440 then
+    raise exception 'PARAMETROS_INVALIDOS';
+  end if;
+  -- Serializa los intentos de una misma clave
+  perform pg_advisory_xact_lock(hashtextextended(p_key_hash, 0));
+  delete from public.online_attempts where created_at < now() - interval '2 days';
+  select count(*) into v_n from public.online_attempts
+   where key_hash = p_key_hash and created_at > now() - make_interval(mins => p_window_minutes);
+  if v_n >= p_max then
+    return false;
+  end if;
+  insert into public.online_attempts (key_hash) values (p_key_hash);
+  return true;
+end;
+$$;
+revoke all on function public.take_online_attempt(text, integer, integer) from public, anon, authenticated;
+grant execute on function public.take_online_attempt(text, integer, integer) to service_role;
